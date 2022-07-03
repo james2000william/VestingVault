@@ -13,12 +13,12 @@ import {SafeERC20} from "oz/token/ERC20/utils/SafeERC20.sol";
 import {FixedPointMathLib} from "solmate/utils/FixedPointMathLib.sol";
 
 
-/// @title Beanstalk VestedERC20
+/// @title VestingVault
 /// @author zrowgz
 /// @author Modified from zefram.eth's VestedERC20 
 /// https://github.com/ZeframLou/vested-erc20/blob/c937b59b14c602cf885b7e144f418a942ee5336b/src/VestedERC20.sol 
-/// @notice An ERC20 token wrapper that linearly vests underlying token during 
-/// the Beanstalk Farms Barnraise Podline payoff period.
+/// @notice An ERC20 token wrapper that linearly vests underlying token based on
+///         a given parameter of an external contract.
 contract VestedERC20 is ERC20 {
 
     /// -----------------------------------------------------------------------
@@ -69,17 +69,19 @@ contract VestedERC20 is ERC20 {
     uint256 immutable PRECISION = 1e18;
 
     // External Addresses
-    /// @notice Address of the underlying asset (either BEAN or BEAN LP)
-    IERC20 public immutable underlying; // address of underlying asset
-    IBarnraisePodline public immutable barnraisePodline; // for accessing the current podline length
-    address public immutable beanstalkProtocol; // for accessing the variables in beanstalk (may replace other addresses)
+    /// @notice Address of the underlying asset
+    IERC20 immutable underlying; // address of underlying asset
+    // address of contract to obtain the parameter for the current state of vesting
+    IExternalContract immutable source;  
+    
+    /// TODO - Remove? address immutable beanstalkProtocol; // for accessing the variables in beanstalk (may replace other addresses)
 
-    /// @notice Owner address - BSF Multisig
+    /// @notice Owner address
     address public owner;
-    /// @notice uint256 Stores forfeit balance
+    /// @notice uint256 Stores forfeit balances
     uint256 public forfeitPool;
-    /// @notice uint256 Stores initial length of barnraise podline
-    uint256 public initalPodlineLength; // for preserving initial podline length for calcs
+    /// @notice uint256 Stores value of initial starting vesting countdown 
+    uint256 public initialVestingCounter;
 
     /// @notice uint256 Stores balance of deposited underlying asset
     uint256 public underlyingBalance;
