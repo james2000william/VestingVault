@@ -14,6 +14,7 @@ Allows for the vested release of tokens based on external factors.
  
 ## Installation
 - Clone repository
+- Create the `IExternalInterface.sol` for the target contract and function call
 
 ---
 

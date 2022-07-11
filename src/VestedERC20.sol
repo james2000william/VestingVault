@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.11;
+pragma solidity 0.8.15;
 
-import {IBarnraisePodline} from "./interfaces/IBarnraisePodline.sol";
+import {IExternalContract} from "./interfaces/IExternalContract.sol";
 
 import {ERC20} from "solmate/tokens/ERC20.sol";
-
-import {IERC20} from "oz/token/ERC20/IERC20.sol";
-import {SafeERC20} from "oz/token/ERC20/utils/SafeERC20.sol";
+import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// TODO This might not be needed if the Decimals work out in the calcs...
 import {FixedPointMathLib} from "solmate/utils/FixedPointMathLib.sol";
@@ -17,8 +16,31 @@ import {FixedPointMathLib} from "solmate/utils/FixedPointMathLib.sol";
 /// @author zrowgz
 /// @author Modified from zefram.eth's VestedERC20 
 /// https://github.com/ZeframLou/vested-erc20/blob/c937b59b14c602cf885b7e144f418a942ee5336b/src/VestedERC20.sol 
-/// @notice An ERC20 token wrapper that linearly vests underlying token based on
-///         a given parameter of an external contract.
+/// @notice An ERC20 token wrapper that linearly vests underlying token based on 
+///         the values obtained from an external contract.
+/// @notice Allows for a liquid vesting position that can be sold on a secondary market
+///         while also allowing users to cash out at a linearly scaled fraction of their position.
+    /**
+    * There should be a value that is reducing over time that allows for the vesting 
+    *   process to progress. This can be either a countdown or a count up.
+    *   For examples,
+    *   - There could be a time based count to a specific block or timestamp, where the
+          difference between current block/time is shrinking as it approaches.  So, having
+          a start value and end value & returning the current value
+        - Token emissions based, like maxSupply - totalSupply
+        - User engagement parameters (although this might add extra gas for specific functions)
+            * Have a goal TVL & check against a snapshot from previous block (to prevent flash loan gaming)
+            * Check a specific function call counter or unique addresses against goal values (gameable)
+            * Fundraising goal versus amount currently raised
+        - This could also be used to hit team goals for unlocking vests:
+            * If attempting to accumulate a specific token, the goal number when team has succeeded
+    * This allows for redeeming at any point, but the farther along to reaching the goal, the more
+        underlying is vested and released.
+        - If redeeming early, the forfeit tokens remain in the pool and are redistributed to remaining users
+    * It also takes into account whether there was a time frame for the fundraise or if duration is open-ended
+        - Redemptions not allowed during the live raise if time-basead
+    */
+
 contract VestedERC20 is ERC20 {
 
     /// -----------------------------------------------------------------------
@@ -32,33 +54,36 @@ contract VestedERC20 is ERC20 {
     /// Errors
     /// -----------------------------------------------------------------------
 
-    error unauthorized();
-    error noPodlineLength();
-    error alreadyInitialized();
-    error insufficientFunds();
-    error emergencyShutdown();
-
+    error Unauthorized();
+    error NoStartingValue();
+    error AlreadyInitialized();
+    error InsufficientFunds();
+    error EmergencyShutdown();
+    error AlreadyClaimed();
+    error RaiseNotCompleted();
 
     /// -----------------------------------------------------------------------
     /// Events
     /// -----------------------------------------------------------------------
 
-    event PodlineSet(uint256 indexed podlineLength);
+    event VestParamSet(uint indexed goal, uint fundraiseEndTime, uint fundraiseStartTime);
 
     event Redeemed(
         address indexed beneficiary, 
-        uint256 underlyingAmount, 
-        uint256 sharesRedeemed, 
-        uint256 sharesForfeit
+        uint underlyingAmount, 
+        uint sharesRedeemed, 
+        uint sharesForfeit
         );
 
     event Deposited(
-        uint256 amountUnderlyingDeposited, 
-        uint256 underlyingBalance, 
-        uint256 BDV
+        uint amountUnderlyingDeposited, 
+        uint underlyingBalance, 
+        uint value
         );
 
     event Shutdown(bool shutdown, bool release, uint timestamp);
+
+    event FundsRecovered(address token, uint amount);
 
 
     /// -----------------------------------------------------------------------
@@ -66,38 +91,34 @@ contract VestedERC20 is ERC20 {
     /// -----------------------------------------------------------------------
 
     /// @notice Immutable decimal precision
-    uint256 immutable PRECISION = 1e18;
+    uint immutable PRECISION = 1e18;
 
     // External Addresses
     /// @notice Address of the underlying asset
-    IERC20 immutable underlying; // address of underlying asset
-    // address of contract to obtain the parameter for the current state of vesting
-    IExternalContract immutable source;  
-    
-    /// TODO - Remove? address immutable beanstalkProtocol; // for accessing the variables in beanstalk (may replace other addresses)
-
+    IERC20 immutable underlying;
+    /// @notice Interface to access the current vesting countdown value
+    IExternalContract immutable vestor; 
     /// @notice Owner address
     address public owner;
-    /// @notice uint256 Stores forfeit balances
-    uint256 public forfeitPool;
-    /// @notice uint256 Stores value of initial starting vesting countdown 
-    uint256 public initialVestingCounter;
 
-    /// @notice uint256 Stores balance of deposited underlying asset
-    uint256 public underlyingBalance;
-    /// @notice uint256 Stores the initial ratio of deposited underlying as BDV
-    uint256 public ratioFactorOfBDV;
-    /// @notice uint256 Stores the BDV of the underlying
-    uint256 public BDV;
+    ////////// Local Storage Vars //////////
+    /// @notice Stores initial value to countdown from for vesting (the goal)
+    uint initialVestingValue;
+    uint goalValue;
+    uint fundraiseEndTime;
+    uint fundraiseStartTime;
+    /// @notice uint Stores balance of deposited underlying asset
+    uint public underlyingBalance;
+    /// @notice The value per underlying token deposited
+    //          This isn't necessary unless needing a conversion of vesting value to another asset.
+    uint public valueRatioToUnderlying;
+    /// @notice uint Stores balance of underlying forfeit from early redemooors
+    uint public forfeitPool;
 
+    ////////// Emergency Checks //////////
     /// @notice Emergency booleans for shutdown & release-vest
     bool public isShutdown; 
     bool public isForceVested;
-
-    /// TODO - Variables to store call paths to correct locations in Beanstalk
-    /// TODO - Set these prior to deployment or through constructor?
-    /// TODO - Evaluate which of these will be needed. Depends upon the method of calling Beanstalk
-    address vestingSilo; // used for minting directly to the vestingToken Silo @ beanstalk
     
 
     /// -----------------------------------------------------------------------
@@ -117,8 +138,7 @@ contract VestedERC20 is ERC20 {
         uint8 _decimals,
         // This contract constructor params
         IERC20 _underlying,
-        IBarnraisePodline _barnraisePodline,// TODO if separate from Beanstalk, use this!
-        address _beanstalkProtocol, // TODO only needed if directly accessing the protocol!
+        IExternalContract _vestor,
         address _owner
         ) ERC20(
             _name,
@@ -126,8 +146,7 @@ contract VestedERC20 is ERC20 {
             _decimals
         ){
         owner = _owner;
-        barnraisePodline = _barnraisePodline;
-        beanstalkProtocol = _beanstalkProtocol;
+        vestor = _vestor;
         underlying = _underlying;
     }
 
@@ -138,7 +157,7 @@ contract VestedERC20 is ERC20 {
 
     modifier onlyOwner() {
         if (msg.sender != owner) {
-            revert unauthorized();
+            revert Unauthorized();
         }
         _;
     }
@@ -151,26 +170,19 @@ contract VestedERC20 is ERC20 {
     /// @notice Set initial length of the Barnraise Podline
     /// @notice Is immutable once set!
     /// @dev Must be ran after Barnraise has concluded
-    function setInitalPodlineLength() external onlyOwner {
+    function setVestingParams() external onlyOwner {
 
-        if (initalPodlineLength != 0) {
-            revert alreadyInitialized();
+        ///////// Checks /////////
+        if (initialVestingValue != 0) {
+            revert AlreadyInitialized();
         }
 
-        // Initialize the length of Barn Raise Podline
-        initalPodlineLength = barnraisePodline.totalPods();
+        // Initialize the params from the external contract
+        goalValue = vestor.getGoalValue();
+        fundraiseEndTime = vestor.getEndTime();
+        fundraiseStartTime = vestor.getStartTime();
 
-        emit PodlineSet(initalPodlineLength);
-    }
-
-    /// TODO Might not want to be able to set this manually if allowing for separate mint & deposit
-    /// @notice Set the initial BDV per underlying
-    function setRatioFactorBDV(uint256 _underlyingToBDV) external onlyOwner returns (uint256) {
-        /// TODO Should this be immutable once deployed? 
-        ///     If funds are recovered later, might be good to be able to adjust this?
-        ratioFactorOfBDV = _underlyingToBDV;
-
-        return (ratioFactorOfBDV);
+        emit VestParamSet(goalValue, fundraiseEndTime, fundraiseStartTime);
     }
 
     /// @notice Mints supply without depositing underlying
@@ -180,31 +192,34 @@ contract VestedERC20 is ERC20 {
 
     /// @notice Deposits underlying without minting shares
     /// @param _underlyingAmountDeposited The amount of underlying assets to deposit.
-    /// @param _bdvOfDeposit The BDV of the entire amount of underlying being deposited.
+    /// @param _valueOfDeposit The BDV of the entire amount of underlying being deposited.
+    /// @dev When the underlying get's deposited, it should not mint shares. Users can then claim their shares, 
+    ///         which would check the balance of the fundraiser.
+    ///         Allows for depositing without sending out vesting shares.
     function depositUnderlying(
         uint256 _underlyingAmountDeposited,
-        uint256 _bdvOfDeposit
+        uint256 _valueOfDeposit
         ) external onlyOwner {
 
-            // To be able to deposit, Barnraise must have completed, therefore, check podlineLength.
-            if (initalPodlineLength == 0) {
-                revert noPodlineLength();
+            // To be able to deposit, must have a target value
+            if (initialVestingValue == 0) {
+                revert NoStartingValue();
             }
 
             // Add the deposited underlying to balance of underlying
             underlyingBalance += _underlyingAmountDeposited;
 
-            // Calculate BDV per share & store as the actualy `ratioFactorOfBDV`
-            ratioFactorOfBDV = totalSupply / _bdvOfDeposit;
+            // Calculate the value per share & store as the actualy `valueRatioToUnderlying`
+            valueRatioToUnderlying = totalSupply / _valueOfDeposit;
 
-            //SolmateERC20 underlyingToken = SolmateERC20(underlying()); /// TODO How does this work?
+            //SolmateERC20 underlyingToken = SolmateERC20(underlying()); 
             underlying.safeTransferFrom(
                 msg.sender,
                 address(this),
                 _underlyingAmountDeposited
             );
 
-            emit Deposited(underlyingBalance, _underlyingAmountDeposited, _bdvOfDeposit);
+            emit Deposited(underlyingBalance, _underlyingAmountDeposited, _valueOfDeposit);
     }
 
     /// TODO This function is only needed IF tokens should be minted ONLY upon deposit of underlying.
@@ -213,45 +228,45 @@ contract VestedERC20 is ERC20 {
     /// @param _to Address to mint the shares to.
     /// @param _underlyingAmountDeposited The amount of underlying tokens to wrap.
     /// @return sharesToMint The amount of wrapped tokens minted.
-    // function wrapAndMint(
-    //     address _to, 
-    //     uint256 _underlyingAmountDeposited
-    //     ) external onlyOwner returns (uint256) {
+    function depositAndMint(
+        address _to, 
+        uint256 _underlyingAmountDeposited
+        ) external onlyOwner returns (uint256) {
 
-    //         /// -------------------------------------------------------------------
-    //         /// Validation
-    //         /// -------------------------------------------------------------------
+            /// -------------------------------------------------------------------
+            /// Validation
+            /// -------------------------------------------------------------------
 
-    //         if (initalPodlineLength == 0) {
-    //             revert noPodlineLength();
-    //         }
+            if (initialVestingValue == 0) {
+                revert NoStartingValue();
+            }
 
-    //         /// -------------------------------------------------------------------
-    //         /// State updates
-    //         /// -------------------------------------------------------------------
+            /// -------------------------------------------------------------------
+            /// State updates
+            /// -------------------------------------------------------------------
 
-    //         // Update the balance of underlying in contract
-    //         underlyingBalance += _underlyingAmountDeposited;
+            // Update the balance of underlying in contract
+            underlyingBalance += _underlyingAmountDeposited;
 
-    //         // Calculate the number of shares to mint
-    //         uint256 sharesToMint = _underlyingAmountDeposited * ratioFactorOfBDV;
+            // Calculate the number of shares to mint
+            uint256 sharesToMint = _underlyingAmountDeposited * valueRatioToUnderlying;
 
-    //         _mint(_to, sharesToMint);
+            _mint(_to, sharesToMint);
 
-    //         /// -------------------------------------------------------------------
-    //         /// Effects
-    //         /// -------------------------------------------------------------------
+            /// -------------------------------------------------------------------
+            /// Effects
+            /// -------------------------------------------------------------------
 
-    //         underlying.safeTransferFrom(
-    //             msg.sender,
-    //             address(this),
-    //             _underlyingAmountDeposited
-    //         );
+            underlying.safeTransferFrom(
+                msg.sender,
+                address(this),
+                _underlyingAmountDeposited
+            );
 
-    //     emit Deposited(underlyingBalance, _underlyingAmountDeposited, sharesToMint);
+        emit Deposited(underlyingBalance, _underlyingAmountDeposited, sharesToMint);
         
-    //     return sharesToMint;
-    // }
+        return sharesToMint;
+    }
 
     /// @notice Halts redemptions and/or vests all tokens completely.
     /// @notice Only callable by owner.
@@ -270,12 +285,18 @@ contract VestedERC20 is ERC20 {
     }
 
     /// TODO Implement this into the appropriate functions if desired
+    ///      * Having this may not be desirable, as investors could be rugged!
     /// @notice Recover all underlying assets to owner address
     /// @dev Does not burn any outstanding shares!
-    function emergencyRecovery() external onlyOwner {
+    function emergencyRecovery(address _token) external onlyOwner {
 
-        // insert logic to transfer underlying to BSF
-        underlying.safeTransfer(owner, underlyingBalance);
+        // Allows for withdrawal of any ERC20
+        if (IERC20(_token) == underlying) {
+            IERC20(_token).safeTransfer(owner, underlyingBalance);
+        }
+        else IERC20(_token).transfer(owner, IERC20(_token).balanceOf(address(this)));
+
+        emit FundsRecovered(_token, IERC20(_token).balanceOf(address(this)));
     }
 
 
@@ -283,21 +304,52 @@ contract VestedERC20 is ERC20 {
     /// User actions
     /// -----------------------------------------------------------------------
 
-    /// TODO Create `convert` logic!
+    /// @notice Allow user to claim shares after contributing to fundraise by
+    //          minting the shares for this vault based on raised funds & deposits.
+    function claimShares() public {
+        // User should have no balance
+        if (balanceOf[msg.sender] != 0) {
+            revert AlreadyClaimed();
+        }
+        if (fundraiseEndTime != 0) {
+            if (fundraiseEndTime < block.timestamp) {
+                revert RaiseNotCompleted();
+            }
+            /// Else, carry on since there's no defined end time of raise.
+        }
+
+        // Get user's balance of contributions
+        uint userContributed = vestor.getUserContributions(msg.sender); /// TODO Check this balance getter
+
+        // Get the total contributed amount
+        uint totalContributions = vestor.getAmountRaised();
+
+        // Mint it!
+        _mint(msg.sender, ((userContributed / totalContributions) * underlyingBalance));
+    }
 
     /// TODO Is reentrancy guard needed? This does call out to obtain podlineLength... 
     /// @notice Allows a holder of the wrapped token to redeem the vested tokens
     /// @notice Acheives this by only accepting `amount`, using `msg.sender` for holder
     /// @param _shares The number of shares to be redeemed
-    function redeem(uint256 _shares) external {
-        if (isShutdown) {
-            revert emergencyShutdown();
-        }
+    function redeem(uint _shares) external {
 
+            /// -------------------------------------------------------------------
+            /// Checks
+            /// -------------------------------------------------------------------
+        if (isShutdown) {
+            revert EmergencyShutdown();
+        }
+        if (fundraiseEndTime != 0) {
+            if (fundraiseEndTime < block.timestamp) {
+                revert RaiseNotCompleted();
+            }
+            /// Else, carry on since there's no defined end time of raise.
+        }
         // Revert if attempting to redeem more than user's balance
         // Also revert if amount is greater than totalSupply
         if (_shares > balanceOf[msg.sender] || _shares > totalSupply) {
-            revert insufficientFunds();
+            revert InsufficientFunds();
         }
 
         // Since the user has a balance, perform the function
@@ -305,9 +357,9 @@ contract VestedERC20 is ERC20 {
 
             // Only allow a user to redeem their own assets
             (
-                uint256 withdrawableUnderlyingAmount, 
-                uint256 sharesBeingRedeemed, 
-                uint256 sharesForfeit
+                uint withdrawableUnderlyingAmount, 
+                uint sharesBeingRedeemed, 
+                uint sharesForfeit
             ) = _previewRedeem(
                     _shares
                 ); 
@@ -315,15 +367,13 @@ contract VestedERC20 is ERC20 {
             /// -------------------------------------------------------------------
             /// State updates
             /// -------------------------------------------------------------------
-/// TODO Ensure these decrements do not underflow!!! 
-    /// Could happen if previous rounding caused changes in accounting
-    /// See example in `redeemMax` for how this might fix it?
+
             // Decrease total supply
             _burn(msg.sender, _shares);
-            //totalSupply -= _shares;
 
             // Decrease Underlying available.
             underlyingBalance -= withdrawableUnderlyingAmount;
+            forfeitPool += sharesForfeit;
 
             /// -------------------------------------------------------------------
             /// Effects
@@ -341,19 +391,19 @@ contract VestedERC20 is ERC20 {
     /// @notice No input parameters as it obtains these values through `msg.sender` & `balanceOf[msg.sender]`
     function redeemMax() external {
         if (isShutdown) {
-            revert emergencyShutdown();
+            revert EmergencyShutdown();
         }
 
         // Revert if attempting to redeem more than user's balance
         if (balanceOf[msg.sender] == 0) {
-            revert insufficientFunds();
+            revert InsufficientFunds();
         }
 
         // Execute _previewRedeem & return the values
         (
-            uint256 withdrawableUnderlyingAmount,  
-            uint256 sharesBeingRedeemed,
-            uint256 sharesForfeit
+            uint withdrawableUnderlyingAmount,  
+            uint sharesBeingRedeemed,
+            uint sharesForfeit
         ) = _previewRedeem(
                 balanceOf[msg.sender]
             ); 
@@ -416,51 +466,74 @@ contract VestedERC20 is ERC20 {
     /// Internal Functions
     /// -----------------------------------------------------------------------
 
+    /// @notice Evaluate how much underlying is released for an amount of shares at this time.
+    /// @param _shares Number of shares to redeem (in wei).
+    /// @return uint Amount of underlying redeemable.
+    /// @return uint Number of shares eligible for redemption.
+    /// @return uint Number of shares forfeit.
+    /// @dev Does not require an address, just the number of shares
+    function _previewRedeem(
+            uint _shares
+        ) internal view returns (uint, uint, uint) {      
+
+            // Get current amount raised
+            uint amountRaised = _getCurrentAmountRaised();
+            // Calculate the fraction the amount raised to goal
+            uint percentOfGoal = _getFractionOfGoal(amountRaised);
+            // Calculate # of shares user can redeem for underlying
+            uint sharesBeingRedeemed = _getRedeemableShares(_shares, percentOfGoal, _amountToRaise); /// TODO Fix calc - decimals!!
+            // Caclulate # of underlying user will receive for # of shares eligible for redemption
+            /// TODO should the getredeemableunderlying use shares or sharesbeingredeemed???
+            uint withdrawableUnderlyingAmount = _getRedeemableUnderlying(sharesBeingRedeemed); /// TODO switch to shares mechanism
+            // Calculate # of shares user forfeits
+            uint sharesForfeit = _shares - sharesBeingRedeemed;
+
+            return (withdrawableUnderlyingAmount, sharesBeingRedeemed, sharesForfeit);
+        }
+
     /// @notice Check the current barnraiser podline length
-    /// @return uint256 Number of pods awaiting payoff
-    function _getPodlineLength() internal view returns (uint256) {
-        return barnraisePodline.totalPods(); /// TODO Update this once known
+    /// @return uint Number of pods awaiting payoff
+    function _getCurrentAmountRaised() internal view returns (uint) {
+        return vestor.getAmountRaised(); 
     }
 
     /// TODO Updated this to be a percent rather than decimal 
     ///     correct the implementations of the values based on Beanstalk
     ///     Ensure that the values align as expected!
     /// @notice Calculates the payoff fraction
-    /// @param _lineLength The current barnraiser podline length
-    /// @return uint256 Percentage of pods remaining
-    function _getPayoffFraction(uint256 _lineLength) internal view returns (uint256) {
+    /// @param _amountRaised The current barnraiser podline length
+    /// @return uint Percentage of pods remaining
+    function _getFractionOfGoal(uint _amountRaised) internal view returns (uint) {
 
-        return (PRECISION - _lineLength * PRECISION / initalPodlineLength); ///TODO Handle these decimals
+        return (PRECISION - _amountRaised * PRECISION / initialVestingValue); ///TODO Handle these decimals
     }
 
     /// @notice Calculates amount of underlying user can redeem presently
     /// @param _shares Amount of vesting tokens to redeem for underlying
-    /// @param _payoffFraction Percent of pods remaining
-    /// @param lineLength Outstanding Barnraise Pods
+    /// @param _percentOfGoal Percent remaining to goal
+    /// @param _amountToRaise Outstanding Barnraise Pods
     /// @return uint256 
     function _getRedeemableShares(
-        uint256 _shares,
-        uint256 _payoffFraction,
-        uint256 lineLength
-    ) internal pure returns (uint256) { 
+        uint _shares,
+        uint _percentOfGoal,
+        uint _amountToRaise
+    ) internal pure returns (uint) { 
 
         /// @notice If podline is not paid off yet, calculate the amount user can redeem
-        if (lineLength > 0) {
+        if (_amountToRaise > 0) {
             // Calculate the amount redeemable
-            return (_payoffFraction * _shares / PRECISION); /// TODO Not a decimal fed in!
+            return (_percentOfGoal * _shares / PRECISION); /// TODO Not a decimal fed in!
         }
 
         return (_shares);
     }
 
-    /// TODO Could have the `lineLength` passed in from the calling function to save calls
-    /// TODO Could pass in amountBeingRedeemed to allow a user to redeem portions
-    /// TODO Could pass in `totalSupply` from the calling function
     /// @notice Calculates a user's share of the forfeit pool
     /// @param _sharesBeingRedeemed The amount of shares user can redeem
+    /// @return uint Return the user's current actual share of underlying.
     function _getRedeemableUnderlying(
-        uint256 _sharesBeingRedeemed
-    ) internal view returns (uint256) {
+        uint _sharesBeingRedeemed
+    ) internal view returns (uint) {
          /// TODO Make sure that if redeeming the last shares, that it withdraws ALL underlying! 
         // if (_sharesBeingRedeemed == totalSupply) {
         //     return underlyingBalance;
@@ -469,75 +542,27 @@ contract VestedERC20 is ERC20 {
         return underlyingBalance * (_sharesBeingRedeemed / totalSupply); /// TODO CHECK DECIMALS!!!
     }
 
-    /// @notice Evaluate how much underlying is released for an amount of shares at this time.
-    /// @param _shares Number of shares to redeem (in wei).
-    /// @return uint256 Amount of underlying redeemable.
-    /// @return uint256 Number of shares eligible for redemption.
-    /// @return uint256 Number of shares forfeit.
-    /// @dev Does not require an address, just the number of shares
-    function _previewRedeem(
-            uint256 _shares
-        ) internal view returns (uint256, uint256, uint256) {      
-
-            // Get current podlineLength
-            uint256 lineLength = _getPodlineLength();
-            // Calculate the fraction the podline has paid off
-            uint256 payoffFraction = _getPayoffFraction(lineLength);
-            // Calculate # of shares user can redeem for underlying
-            uint256 sharesBeingRedeemed = _getRedeemableShares(_shares, payoffFraction, lineLength); /// TODO Fix calc - decimals!!
-            // Caclulate # of underlying user will receive for # of shares eligible for redemption
-            /// TODO should the getredeemableunderlying use shares or sharesbeingredeemed???
-            uint256 withdrawableUnderlyingAmount = _getRedeemableUnderlying(sharesBeingRedeemed); /// TODO switch to shares mechanism
-            // Calculate # of shares user forfeits
-            uint256 sharesForfeit = _shares - sharesBeingRedeemed;
-
-            return (withdrawableUnderlyingAmount, sharesBeingRedeemed, sharesForfeit);
-        }
-
-
     /// -----------------------------------------------------------------------
     /// External Functions
     /// -----------------------------------------------------------------------
 
     /// @notice Computes the amount of vested tokens redeemable by an account
     /// @param _shares Amount of shares to redeem at this time
-    /// @return uint256 Amount of underlying available to redeem shares for presently.
-    /// @return uint256 Number of shares being redeemed.
-    /// @return uint256 Number of shares being forfeit.
-    function previewRedeem(
-            uint256 _shares
-        ) external view returns (uint256, uint256, uint256) {
-            /// TODO Correct this so that it works for our use case
-            /// TODO Requires an entire new function to calculate using an address param
-            return _previewRedeem(_shares);
-        }
+    /// @return uint Amount of underlying available to redeem shares for presently.
+    /// @return uint Number of shares being redeemed.
+    /// @return uint Number of shares being forfeit.
+    function previewRedeem(uint _shares) external view returns (uint, uint, uint) {
+        /// TODO Requires an entire new function to calculate using an address param
+        return _previewRedeem(_shares);
+    }
+
+    function previewUserRedeem(address _user) external view returns (uint, uint, uint) {
+        return _previewRedeem(balanceOf[_user]); 
+    }
 
     /// @notice Obtains current length of the Barn Raise Podline
-    /// @return uint256 Current length of Barnraise Podline
-    function getPodlineLength() external view returns (uint256) {
-        return _getPodlineLength();
+    /// @return uint Current length of Barnraise Podline
+    function getCurrentAmountRaised() external view returns (uint) {
+        return _getCurrentAmountRaised();
     }
 }
-
-    /**
-    TODO:
-    - Update variables based on Beanstalk addresses
-    - Ensure ability to access either the Facet (see Note below) or the BR Podline
-    - ENSURE CORRECT HANDLING OF MATH - DECIMAL ISSUE WITH PAYOFF FRACTION!!!
-        - How many decimals to round to?
-        - Could implement the imported library if concerns...
-    
-    Note
-    - To access a facet:
-    Source: https://github.com/bugout-dev/lootbox/blob/a317f451decbb6383abf79a1175639030837faf6/contracts/Lootbox.sol#L95
-    ```
-    address public terminusAddress; //just store the address
-    TerminusFacet terminusContract = TerminusFacet(terminusAddress);
-    terminusContract.mint(to, administratorPoolId, 1, "");
-    ```
-
-    Notes:
-    - NOT adding `payable` to an address causes increased gas costs, wild!
-
-    */
-
