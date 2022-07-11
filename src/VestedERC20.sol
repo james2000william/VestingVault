@@ -14,32 +14,12 @@ import {FixedPointMathLib} from "solmate/utils/FixedPointMathLib.sol";
 
 /// @title VestingVault
 /// @author zrowgz
-/// @author Modified from zefram.eth's VestedERC20 
-/// https://github.com/ZeframLou/vested-erc20/blob/c937b59b14c602cf885b7e144f418a942ee5336b/src/VestedERC20.sol 
+///     Modified from zefram.eth's VestedERC20 
+///     https://github.com/ZeframLou/vested-erc20/blob/c937b59b14c602cf885b7e144f418a942ee5336b/src/VestedERC20.sol 
 /// @notice An ERC20 token wrapper that linearly vests underlying token based on 
 ///         the values obtained from an external contract.
 /// @notice Allows for a liquid vesting position that can be sold on a secondary market
 ///         while also allowing users to cash out at a linearly scaled fraction of their position.
-    /**
-    * There should be a value that is reducing over time that allows for the vesting 
-    *   process to progress. This can be either a countdown or a count up.
-    *   For examples,
-    *   - There could be a time based count to a specific block or timestamp, where the
-          difference between current block/time is shrinking as it approaches.  So, having
-          a start value and end value & returning the current value
-        - Token emissions based, like maxSupply - totalSupply
-        - User engagement parameters (although this might add extra gas for specific functions)
-            * Have a goal TVL & check against a snapshot from previous block (to prevent flash loan gaming)
-            * Check a specific function call counter or unique addresses against goal values (gameable)
-            * Fundraising goal versus amount currently raised
-        - This could also be used to hit team goals for unlocking vests:
-            * If attempting to accumulate a specific token, the goal number when team has succeeded
-    * This allows for redeeming at any point, but the farther along to reaching the goal, the more
-        underlying is vested and released.
-        - If redeeming early, the forfeit tokens remain in the pool and are redistributed to remaining users
-    * It also takes into account whether there was a time frame for the fundraise or if duration is open-ended
-        - Redemptions not allowed during the live raise if time-basead
-    */
 
 contract VestedERC20 is ERC20 {
 
@@ -71,8 +51,7 @@ contract VestedERC20 is ERC20 {
     event Redeemed(
         address indexed beneficiary, 
         uint underlyingAmount, 
-        uint sharesRedeemed, 
-        uint sharesForfeit
+        uint sharesRedeemed
         );
 
     event Deposited(
@@ -103,7 +82,7 @@ contract VestedERC20 is ERC20 {
 
     ////////// Local Storage Vars //////////
     /// @notice Stores initial value to countdown from for vesting (the goal)
-    uint initialVestingValue;
+    // uint initialVestingValue;
     uint goalValue;
     uint fundraiseEndTime;
     uint fundraiseStartTime;
@@ -112,8 +91,8 @@ contract VestedERC20 is ERC20 {
     /// @notice The value per underlying token deposited
     //          This isn't necessary unless needing a conversion of vesting value to another asset.
     uint public valueRatioToUnderlying;
-    /// @notice uint Stores balance of underlying forfeit from early redemooors
-    uint public forfeitPool;
+    /// notice uint Stores balance of underlying forfeit from early redemooors
+    //uint public forfeitPool;
 
     ////////// Emergency Checks //////////
     /// @notice Emergency booleans for shutdown & release-vest
@@ -173,7 +152,7 @@ contract VestedERC20 is ERC20 {
     function setVestingParams() external onlyOwner {
 
         ///////// Checks /////////
-        if (initialVestingValue != 0) {
+        if (goalValue != 0) {
             revert AlreadyInitialized();
         }
 
@@ -202,7 +181,7 @@ contract VestedERC20 is ERC20 {
         ) external onlyOwner {
 
             // To be able to deposit, must have a target value
-            if (initialVestingValue == 0) {
+            if (goalValue == 0) {
                 revert NoStartingValue();
             }
 
@@ -222,29 +201,24 @@ contract VestedERC20 is ERC20 {
             emit Deposited(underlyingBalance, _underlyingAmountDeposited, _valueOfDeposit);
     }
 
-    /// TODO This function is only needed IF tokens should be minted ONLY upon deposit of underlying.
     /// @notice Mints wrapped tokens using underlying tokens.
     /// @notice Only performed by BSF.
     /// @param _to Address to mint the shares to.
     /// @param _underlyingAmountDeposited The amount of underlying tokens to wrap.
     /// @return sharesToMint The amount of wrapped tokens minted.
+    /// @dev This function is only needed IF tokens should be minted ONLY upon deposit of underlying.
     function depositAndMint(
         address _to, 
         uint256 _underlyingAmountDeposited
         ) external onlyOwner returns (uint256) {
 
-            /// -------------------------------------------------------------------
-            /// Validation
-            /// -------------------------------------------------------------------
+            ////////// Checks //////////
 
-            if (initialVestingValue == 0) {
+            if (goalValue == 0) {
                 revert NoStartingValue();
             }
 
-            /// -------------------------------------------------------------------
-            /// State updates
-            /// -------------------------------------------------------------------
-
+            ////////// State Updates //////////
             // Update the balance of underlying in contract
             underlyingBalance += _underlyingAmountDeposited;
 
@@ -253,10 +227,7 @@ contract VestedERC20 is ERC20 {
 
             _mint(_to, sharesToMint);
 
-            /// -------------------------------------------------------------------
-            /// Effects
-            /// -------------------------------------------------------------------
-
+            ////////// Effects //////////
             underlying.safeTransferFrom(
                 msg.sender,
                 address(this),
@@ -334,9 +305,7 @@ contract VestedERC20 is ERC20 {
     /// @param _shares The number of shares to be redeemed
     function redeem(uint _shares) external {
 
-            /// -------------------------------------------------------------------
-            /// Checks
-            /// -------------------------------------------------------------------
+        ////////// Checks //////////
         if (isShutdown) {
             revert EmergencyShutdown();
         }
@@ -358,31 +327,25 @@ contract VestedERC20 is ERC20 {
             // Only allow a user to redeem their own assets
             (
                 uint withdrawableUnderlyingAmount, 
-                uint sharesBeingRedeemed, 
-                uint sharesForfeit
+                uint sharesBeingRedeemed//, 
+                //uint sharesForfeit
             ) = _previewRedeem(
                     _shares
                 ); 
 
-            /// -------------------------------------------------------------------
-            /// State updates
-            /// -------------------------------------------------------------------
-
+            ////////// State Updates //////////
             // Decrease total supply
             _burn(msg.sender, _shares);
 
             // Decrease Underlying available.
             underlyingBalance -= withdrawableUnderlyingAmount;
-            forfeitPool += sharesForfeit;
+            //forfeitPool += sharesForfeit;
 
-            /// -------------------------------------------------------------------
-            /// Effects
-            /// -------------------------------------------------------------------
-
+            ////////// Effects //////////
             // Transfer the withdrawable amount to the user address
             underlying.safeTransfer(msg.sender, withdrawableUnderlyingAmount);
 
-            emit Redeemed(msg.sender, withdrawableUnderlyingAmount, sharesBeingRedeemed, sharesForfeit);
+            emit Redeemed(msg.sender, withdrawableUnderlyingAmount, sharesBeingRedeemed); //, sharesForfeit);
         }
     }
 
@@ -390,10 +353,11 @@ contract VestedERC20 is ERC20 {
     /// @notice Executes redemption of a user's entire balance.
     /// @notice No input parameters as it obtains these values through `msg.sender` & `balanceOf[msg.sender]`
     function redeemMax() external {
+
+        ////////// Checks //////////
         if (isShutdown) {
             revert EmergencyShutdown();
         }
-
         // Revert if attempting to redeem more than user's balance
         if (balanceOf[msg.sender] == 0) {
             revert InsufficientFunds();
@@ -402,16 +366,13 @@ contract VestedERC20 is ERC20 {
         // Execute _previewRedeem & return the values
         (
             uint withdrawableUnderlyingAmount,  
-            uint sharesBeingRedeemed,
-            uint sharesForfeit
+            uint sharesBeingRedeemed//,
+            //uint sharesForfeit
         ) = _previewRedeem(
                 balanceOf[msg.sender]
             ); 
 
-        /// -------------------------------------------------------------------
-        /// State updates
-        /// -------------------------------------------------------------------
-
+        ////////// State Updates //////////
 /// TODO Ensure these decrements do not underflow!!! Could happen if previous rounding caused changes in accounting
         // like, if these are the last shares outstanding, then withdraw all underlying.
         // If these are the last redeemable shares:
@@ -430,14 +391,11 @@ contract VestedERC20 is ERC20 {
             underlyingBalance -= withdrawableUnderlyingAmount;
         }
 
-        /// -------------------------------------------------------------------
-        /// Effects
-        /// -------------------------------------------------------------------
-
+        ////////// Effects //////////
         // Transfer the withdrawable amount to the user address
         underlying.safeTransfer(msg.sender, withdrawableUnderlyingAmount);
 
-        emit Redeemed(msg.sender, withdrawableUnderlyingAmount, sharesBeingRedeemed, sharesForfeit);
+        emit Redeemed(msg.sender, withdrawableUnderlyingAmount, sharesBeingRedeemed); //, sharesForfeit);
     }
 
     /// @notice Emergency user withdrawal of underlying
@@ -470,25 +428,25 @@ contract VestedERC20 is ERC20 {
     /// @param _shares Number of shares to redeem (in wei).
     /// @return uint Amount of underlying redeemable.
     /// @return uint Number of shares eligible for redemption.
-    /// @return uint Number of shares forfeit.
+    /// return uint Number of shares forfeit.
     /// @dev Does not require an address, just the number of shares
     function _previewRedeem(
             uint _shares
-        ) internal view returns (uint, uint, uint) {      
+        ) internal view returns (uint, uint) { //, uint) {      
 
             // Get current amount raised
             uint amountRaised = _getCurrentAmountRaised();
             // Calculate the fraction the amount raised to goal
             uint percentOfGoal = _getFractionOfGoal(amountRaised);
             // Calculate # of shares user can redeem for underlying
-            uint sharesBeingRedeemed = _getRedeemableShares(_shares, percentOfGoal, _amountToRaise); /// TODO Fix calc - decimals!!
+            uint sharesBeingRedeemed = _getRedeemableShares(_shares, percentOfGoal, amountRaised);
             // Caclulate # of underlying user will receive for # of shares eligible for redemption
-            /// TODO should the getredeemableunderlying use shares or sharesbeingredeemed???
-            uint withdrawableUnderlyingAmount = _getRedeemableUnderlying(sharesBeingRedeemed); /// TODO switch to shares mechanism
+            uint withdrawableUnderlyingAmount = _getRedeemableUnderlying(sharesBeingRedeemed);
             // Calculate # of shares user forfeits
-            uint sharesForfeit = _shares - sharesBeingRedeemed;
+            /// TODO Forfeit Shares not needed since they're burned & underlying remain in vault
+            // uint sharesForfeit = _shares - sharesBeingRedeemed;
 
-            return (withdrawableUnderlyingAmount, sharesBeingRedeemed, sharesForfeit);
+            return (withdrawableUnderlyingAmount, sharesBeingRedeemed); //, sharesForfeit);
         }
 
     /// @notice Check the current barnraiser podline length
@@ -505,22 +463,23 @@ contract VestedERC20 is ERC20 {
     /// @return uint Percentage of pods remaining
     function _getFractionOfGoal(uint _amountRaised) internal view returns (uint) {
 
-        return (PRECISION - _amountRaised * PRECISION / initialVestingValue); ///TODO Handle these decimals
+        return (PRECISION - _amountRaised * PRECISION / goalValue); ///TODO Handle these decimals
     }
 
     /// @notice Calculates amount of underlying user can redeem presently
     /// @param _shares Amount of vesting tokens to redeem for underlying
     /// @param _percentOfGoal Percent remaining to goal
-    /// @param _amountToRaise Outstanding Barnraise Pods
+    /// @param _amountRaised The amount currently raised
     /// @return uint256 
     function _getRedeemableShares(
         uint _shares,
         uint _percentOfGoal,
-        uint _amountToRaise
-    ) internal pure returns (uint) { 
+        uint _amountRaised
+    ) internal view returns (uint) { 
 
-        /// @notice If podline is not paid off yet, calculate the amount user can redeem
-        if (_amountToRaise > 0) {
+        // If the goal has been reached, save some gas & skip calc
+        // OK to have amountRaised be more than goal, as a neg is less/equalto 0
+        if ((goalValue -  _amountRaised) > 0) {
             // Calculate the amount redeemable
             return (_percentOfGoal * _shares / PRECISION); /// TODO Not a decimal fed in!
         }
@@ -542,6 +501,7 @@ contract VestedERC20 is ERC20 {
         return underlyingBalance * (_sharesBeingRedeemed / totalSupply); /// TODO CHECK DECIMALS!!!
     }
 
+
     /// -----------------------------------------------------------------------
     /// External Functions
     /// -----------------------------------------------------------------------
@@ -550,13 +510,13 @@ contract VestedERC20 is ERC20 {
     /// @param _shares Amount of shares to redeem at this time
     /// @return uint Amount of underlying available to redeem shares for presently.
     /// @return uint Number of shares being redeemed.
-    /// @return uint Number of shares being forfeit.
-    function previewRedeem(uint _shares) external view returns (uint, uint, uint) {
+    /// return uint Number of shares being forfeit.
+    function previewRedeem(uint _shares) external view returns (uint, uint) { //, uint) {
         /// TODO Requires an entire new function to calculate using an address param
         return _previewRedeem(_shares);
     }
 
-    function previewUserRedeem(address _user) external view returns (uint, uint, uint) {
+    function previewUserRedeem(address _user) external view returns (uint, uint) { //, uint) {
         return _previewRedeem(balanceOf[_user]); 
     }
 
